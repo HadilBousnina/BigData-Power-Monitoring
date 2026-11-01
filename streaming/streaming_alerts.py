@@ -1,3 +1,4 @@
+from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
@@ -39,6 +40,7 @@ def traiter(batch_df, batch_id):
               .withColumn("z", (F.col("avg_kw") - F.col("mean_kw")) / F.col("std_kw")))
     rows = scored.collect()
     db = MongoClient("mongodb://mongo:27017")["power"]
+    now = datetime.utcnow()
     for r in rows:
         doc = {"_id": str(r["start"]), "start": r["start"],
                "avg_kw": r["avg_kw"], "mean_kw": r["mean_kw"],
@@ -46,6 +48,8 @@ def traiter(batch_df, batch_id):
         db["windows"].replace_one({"_id": doc["_id"]}, doc, upsert=True)
         if doc["alert"]:
             db["alerts"].replace_one({"_id": doc["_id"]}, doc, upsert=True)
+    if rows:
+        db["status"].replace_one({"_id": "streaming"},{"_id": "streaming", "last_write": now}, upsert=True)   
     print(f"lot {batch_id} : {len(rows)} fenetres traitees")
 
 query = (windows.writeStream
