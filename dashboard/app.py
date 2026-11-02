@@ -32,9 +32,21 @@ def get_db():
 
 db = get_db()
 
+st.title("⚡ Surveillance de la consommation electrique")
+
+try:
+    db.command("ping")
+except Exception as e:
+    st.error(f"MongoDB injoignable : {e}")
+    st.stop()
+
+FOYERS = sorted(db.profiles.distinct("household_id")) or [0]
+
 # ------------------------------------------------------------ barre laterale
 with st.sidebar:
     st.header("Parametres")
+    HID = st.selectbox("Foyer", FOYERS, format_func=lambda h: f"Foyer {h}"
+                       + (" (reel)" if h == 0 else " (synthetique)"))
     n_hours = st.slider("Heures affichees", 12, 24 * 14, 72, step=12)
     Z = st.slider("Seuil d'alerte (z-score)", 0.5, 5.0, 2.0, 0.1)
     auto = st.checkbox("Rafraichissement automatique", value=True)
@@ -45,26 +57,18 @@ with st.sidebar:
                "puissance moyenne d'une fenetre de 15 minutes, comparee au comportement "
                "normal calcule en batch sur HDFS.")
 
-st.title("⚡ Surveillance de la consommation electrique")
-
-try:
-    db.command("ping")
-except Exception as e:
-    st.error(f"MongoDB injoignable : {e}")
-    st.stop()
-
-
 def spark_dow(ts):
     """Jour de semaine au format Spark (1 = dimanche) a partir d'un Timestamp pandas."""
     return (ts.dayofweek + 1) % 7 + 1
 
 
 def load_windows(limit):
-    rows = list(db.windows.find({}, {"_id": 0}).sort("start", -1).limit(limit))
+    rows = list(db.windows.find({"household_id": HID}, {"_id": 0}).sort("start", -1).limit(limit))
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).sort_values("start").reset_index(drop=True)
-    prof = {(p["dow"], p["hour"]): p["std_kw"] for p in db.profiles.find({}, {"_id": 0})}
+    prof = {(p["dow"], p["hour"]): p["std_kw"]
+            for p in db.profiles.find({"household_id": HID}, {"_id": 0})}
     df["std_kw"] = [prof.get((spark_dow(t), t.hour)) for t in df["start"]]
     df["z"] = df["z"].astype(float)
     df["alert"] = df["z"] >= Z
@@ -101,8 +105,8 @@ def realtime_view():
                 "puis le producteur.")
         return
 
-    total = db.windows.count_documents({})
-    n_alerts = db.windows.count_documents({"z": {"$gte": Z}})
+    total = db.windows.count_documents({"household_id": HID})
+    n_alerts = db.windows.count_documents({"household_id": HID, "z": {"$gte": Z}})
     last = df.iloc[-1]
     etat, age = flux_status()
 
@@ -159,7 +163,7 @@ def realtime_view():
             st.dataframe(a.round(2), use_container_width=True, hide_index=True)
     with right:
         st.subheader("Alertes par jour")
-        pipeline = [{"$match": {"z": {"$gte": Z}}},
+        pipeline = [{"$match": {"household_id": HID, "z": {"$gte": Z}}},
                     {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$start"}},
                                 "n": {"$sum": 1}}},
                     {"$sort": {"_id": 1}}]
@@ -176,7 +180,7 @@ def realtime_view():
 
 # ------------------------------------------------------------ onglet 2 : profil de reference
 def reference_view():
-    ref = list(db.profiles.find({}, {"_id": 0}))
+    ref = list(db.profiles.find({"household_id": HID}, {"_id": 0}))
     if not ref:
         st.info("Profils absents : lancez profiles_power.py puis profiles_to_mongo.py.")
         return
@@ -211,7 +215,7 @@ def reference_view():
 
 # ------------------------------------------------------------ onglet 3 : historique batch
 def history_view():
-    daily = list(db.daily_stats.find({}, {"_id": 0}).sort("day", 1))
+    daily = list(db.daily_stats.find({"household_id": HID}, {"_id": 0}).sort("day", 1))
     if not daily:
         st.info("Statistiques journalieres absentes : lancez batch_daily.py (Spark batch).")
         return
@@ -255,7 +259,8 @@ def pipeline_view():
     n_al = db.windows.count_documents({"z": {"$gte": Z}})
     last = db.windows.find_one({}, {"start": 1}, sort=[("start", -1)])
     rows = [
-        ("Batch : profils de reference", n_ref, "168 attendus (7 jours x 24 h)", n_ref == 168),
+        ("Batch : profils de reference", n_ref,
+         f"{168 * len(FOYERS)} attendus (168 x {len(FOYERS)} foyers)", n_ref == 168 * len(FOYERS)),
         ("Batch : statistiques journalieres", n_day, "au moins une ligne (optionnel)", n_day > 0),
         ("Streaming : fenetres de 15 min", n_w, "croit pendant le rejeu", n_w > 0),
         (f"Streaming : alertes (z >= {Z:g})", n_al, "depend des anomalies", True),
@@ -265,6 +270,22 @@ def pipeline_view():
     st.dataframe(t, use_container_width=True, hide_index=True)
     if last:
         st.caption(f"Derniere fenetre traitee (temps d'evenement) : {last['start']:%Y-%m-%d %H:%M}")
+
+    if len(FOYERS) > 1:
+        st.subheader("Alertes par foyer")
+        par_foyer = list(db.windows.aggregate([
+            {"$group": {"_id": "$household_id", "fenetres": {"$sum": 1},
+                        "alertes": {"$sum": {"$cond": [{"$gte": ["$z", Z]}, 1, 0]}}}},
+            {"$sort": {"_id": 1}}]))
+        if par_foyer:
+            p = pd.DataFrame(par_foyer).rename(columns={"_id": "Foyer"})
+            p["% alertes"] = (100 * p["alertes"] / p["fenetres"]).round(1)
+            f3 = go.Figure(go.Bar(x=p["Foyer"].astype(str), y=p["alertes"], marker_color=ROUGE))
+            f3.update_layout(template="plotly_white", height=260, margin=dict(l=10, r=10, t=10, b=10),
+                             xaxis_title="Foyer", yaxis_title="Alertes")
+            st.plotly_chart(f3, use_container_width=True)
+            st.dataframe(p.rename(columns={"fenetres": "Fenetres", "alertes": "Alertes"}),
+                         use_container_width=True, hide_index=True)
     st.markdown(
         "**Chaine de traitement** : fichier brut (HDFS) -> Spark batch (nettoyage, profils) -> "
         "MongoDB ; producteur -> Kafka -> Spark Structured Streaming (fenetres de 15 minutes, "

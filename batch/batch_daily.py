@@ -6,21 +6,22 @@ from pyspark.sql import functions as F
 
 spark = SparkSession.builder.appName("batch_daily").getOrCreate()
 
-# Donnees propres (toutes annees) : Global_active_power en kW par minute,
+# Donnees de tous les foyers : Global_active_power en kW par minute,
 # Sub_metering_1/2/3 en Wh par minute (cuisine, buanderie, chauffe-eau et clim)
-df = spark.read.parquet("hdfs:///data/power/clean")
+df = spark.read.parquet("hdfs:///data/power/clean_multi")
 
 daily = (df.withColumn("day", F.to_date("ts"))
-           .groupBy("day")
+           .groupBy("household_id", "day")
            .agg((F.sum("Global_active_power") / 60).alias("kwh"),
                 F.max("Global_active_power").alias("max_kw"),
                 (F.sum("Sub_metering_1") / 1000).alias("kwh_kitchen"),
                 (F.sum("Sub_metering_2") / 1000).alias("kwh_laundry"),
                 (F.sum("Sub_metering_3") / 1000).alias("kwh_heating_ac"))
-           .orderBy("day")
+           .orderBy("household_id", "day")
            .collect())
 
-docs = [{"_id": str(r["day"]),
+docs = [{"_id": f"{r['household_id']}-{r['day']}",
+         "household_id": r["household_id"],
          "day": datetime.combine(r["day"], datetime.min.time()),
          "kwh": float(r["kwh"]), "max_kw": float(r["max_kw"]),
          "kwh_kitchen": float(r["kwh_kitchen"] or 0),
@@ -30,5 +31,6 @@ docs = [{"_id": str(r["day"]),
 col = MongoClient("mongodb://mongo:27017")["power"]["daily_stats"]
 col.delete_many({})
 col.insert_many(docs)
-print("Jours dans MongoDB :", col.count_documents({}))
+col.create_index([("household_id", 1), ("day", 1)])
+print("Jours-foyers dans MongoDB :", col.count_documents({}))
 spark.stop()
