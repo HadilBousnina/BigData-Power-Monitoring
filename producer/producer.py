@@ -7,7 +7,7 @@ from datetime import datetime
 from kafka import KafkaProducer
 
 FICHIER = r"C:\Users\bousn\Downloads\individual+household+electric+power+consumption\household_power_consumption.txt"
-PAUSE = 0.1   # secondes entre deux minutes rejouees (plus petit = plus rapide)
+PAUSE = 0.1   # Délai en secondes entre deux minutes rejouées
 
 # Nombre de foyers rejoues : doit etre egal au N passe a batch/generate_households.py.
 # Usage : python producer/producer.py 20     (sans argument : 1 foyer, comme avant)
